@@ -8,15 +8,20 @@
  * - Automatic redirect after form submission
  * - Secure file operations with error handling
  * - Buffer overflow protection
+ * - LCD 2x16 I2C display
+ * - Buzzer and LED feedback
  * 
  * Pin Configuration:
  * - PN532 RFID (UART2): RX=16, TX=17
  * - W5500 Ethernet: SCK=18, MISO=19, MOSI=23, CS=5
- * - Output Pin: GPIO4 (Changeable, must be output-capable)
+ * - Output Pin: GPIO4 
+ * - LCD I2C: SDA=21, SCL=22
+ * - Buzzer: GPIO25
+ * - LED: GPIO26
  * 
  * Network:
- * - Static IP: 192.168.1.177 (configurable)
- * - MAC: DE:AD:BE:EF:FE:ED (unique per device)
+ * - Static IP: 192.168.1.177
+ * - MAC: DE:AD:BE:EF:FE:ED
  */
 
 #include <SPI.h>
@@ -25,12 +30,18 @@
 #include "SPIFFS.h"
 #include <Adafruit_PN532.h>
 #include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
 // Configuration Constants
 #define MAX_ROWS 200
 #define MAX_REQUEST_LENGTH 512
-#define OUTPUT_PIN 4         // Using GPIO4 which is a valid output pin
+#define OUTPUT_PIN 4         // Main access control output
+#define BUZZER_PIN 25        // Buzzer pin
+#define LED_PIN 26           // LED pin
 #define RFID_CHECK_INTERVAL 100  // ms between RFID checks
+
+// LCD Configuration
+LiquidCrystal_I2C lcd(0x27, 16, 2); // I2C address 0x27, 16 chars, 2 lines
 
 String fileRows[MAX_ROWS];
 byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
@@ -56,20 +67,34 @@ unsigned long lastRfidCheck = 0;
 void setup() {
   Serial.begin(115200);
   
-  // Initialize output pin
+  // Initialize output pins
   pinMode(OUTPUT_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
   digitalWrite(OUTPUT_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("Tempel Kartu");
 
   // Initialize RFID reader
   PN532Serial.begin(115200, SERIAL_8N1, 16, 17);
   if (!nfc.begin()) {
     Serial.println("❌ Failed to initialize PN532");
+    lcd.clear();
+    lcd.print("RFID Error!");
     while (1);
   }
   
   uint32_t versiondata = nfc.getFirmwareVersion();
   if (!versiondata) {
     Serial.println("❌ Didn't find PN532");
+    lcd.clear();
+    lcd.print("No RFID Reader");
     while (1);
   }
   
@@ -79,6 +104,8 @@ void setup() {
   // Initialize filesystem
   if (!SPIFFS.begin(true)) {
     Serial.println("❌ Failed to mount SPIFFS");
+    lcd.clear();
+    lcd.print("FS Error!");
     while (1);
   }
 
@@ -238,14 +265,80 @@ void handleRFID() {
       
       if (checkCardAccess(String_ID)) {
         Serial.println("✅ Access granted - Activating output");
-        digitalWrite(OUTPUT_PIN, HIGH);
-        delay(1000);
-        digitalWrite(OUTPUT_PIN, LOW);
+        grantAccess(String_ID);
       } else {
         Serial.println("❌ Access denied");
+        accessDenied();
       }
     }
   }
+}
+
+void grantAccess(String cardId) {
+  // Activate main output
+  digitalWrite(OUTPUT_PIN, HIGH);
+  
+  // Find card owner name
+  String ownerName = "Unknown";
+  for (int i = 0; i < MAX_ROWS; i++) {
+    if (fileRows[i].startsWith(cardId + "|")) {
+      int firstPipe = fileRows[i].indexOf('|');
+      int secondPipe = fileRows[i].indexOf('|', firstPipe + 1);
+      ownerName = fileRows[i].substring(firstPipe + 1, secondPipe);
+      break;
+    }
+  }
+  
+  // Update LCD
+  lcd.clear();
+  lcd.print("Access Granted");
+  lcd.setCursor(0, 1);
+  lcd.print(ownerName);
+  
+  // Activate buzzer and LED
+  digitalWrite(BUZZER_PIN, HIGH);
+  digitalWrite(LED_PIN, HIGH);
+  delay(200);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+  delay(200);
+  digitalWrite(BUZZER_PIN, HIGH);
+  digitalWrite(LED_PIN, HIGH);
+  delay(200);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(LED_PIN, LOW);
+  
+  // Keep main output active for 1 second
+  delay(600); // Remaining 600ms of the 1 second total
+  digitalWrite(OUTPUT_PIN, LOW);
+  
+  // Reset LCD after 2 seconds
+  delay(1000);
+  lcd.clear();
+  lcd.print("Tempel Kartu");
+}
+
+void accessDenied() {
+  // Update LCD
+  lcd.clear();
+  lcd.print("Access Denied!");
+  lcd.setCursor(0, 1);
+  lcd.print("Unauthorized");
+  
+  // Activate buzzer and LED
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+  
+  // Reset LCD after 2 seconds
+  delay(1500);
+  lcd.clear();
+  lcd.print("Tempel Kartu");
 }
 
 bool checkCardAccess(String cardId) {
@@ -566,9 +659,9 @@ String generateHTMLTable() {
         String enable = fileRows[i].substring(thirdPipe + 1);
         
         table += "<tr>";
-        table += "<td>" + id + "</td>";
-        table += "<td>" + name + "</td>";
-        table += "<td>" + unit + "</td>";
+        table += "<td>" + id + "</td>");
+        table += "<td>" + name + "</td>");
+        table += "<td>" + unit + "</td>");
         
         table += "<td>";
         if (enable == "1") {
