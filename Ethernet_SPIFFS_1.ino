@@ -1,262 +1,179 @@
-#include <SPI.h>           // Library komunikasi SPI
-#include <Ethernet.h>      // Library Ethernet untuk koneksi web server
-#include "FS.h"            // File System untuk ESP32
-#include "SPIFFS.h"        // SPIFFS sebagai media penyimpanan file di flash
+#include <SPI.h>              // Library komunikasi SPI
+#include <Ethernet.h>         // Library Ethernet untuk koneksi jaringan (W5500)
+#include "FS.h"               // File System (abstraksi)
+#include "SPIFFS.h"           // File system SPIFFS untuk menyimpan file di flash
+#include <Adafruit_PN532.h>   // Library untuk modul RFID PN532
+#include <Wire.h>             // Library I2C (tidak digunakan di sini, tapi biasa default untuk PN532)
 
-// Konfigurasi alamat MAC dan IP statis
+#define MAX_ROWS 200          // Batas maksimum baris yang akan dibaca dari file
+String fileRows[MAX_ROWS];    // Array untuk menyimpan baris-baris file
+
+// Konfigurasi alamat MAC dan IP statis untuk W5500
 byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-IPAddress ip(192, 168, 1, 177); // IP statis untuk ESP32
-EthernetServer server(80);     // Membuat server di port 80 (HTTP)
+IPAddress ip(192, 168, 1, 177);     // IP statis ESP32
+EthernetServer server(80);         // Membuat server HTTP di port 80
 
-// Konfigurasi pin SPI untuk W5500 pada ESP32
+// Konfigurasi komunikasi RFID PN532 menggunakan UART2 (GPIO 16 dan 17)
+HardwareSerial PN532Serial(2);      // UART2 pada ESP32
+Adafruit_PN532 nfc(PN532Serial);    // Inisialisasi objek PN532
+
+String String_ID = "";              // Variabel untuk menyimpan hasil ID kartu RFID
+
+// Konfigurasi pin SPI untuk W5500 (disesuaikan dengan board ESP32 kamu)
 #define PIN_SCK  18
 #define PIN_MISO 19
 #define PIN_MOSI 23
 #define PIN_CS   5
 
-// Lokasi file data
+// Pin GPIO untuk output
+#define OUTPUT_PIN 36
+
+// Path file di SPIFFS
 const char* dataPath = "/data.txt";
 
-// Variabel global
-String currentRequest = "";
-EthernetClient client;
-unsigned long lastClientCheck = 0;
-const unsigned long clientTimeout = 1000;
+// Variabel tambahan untuk web server
+String currentRequest = "";                   // Menyimpan request HTTP dari client
+EthernetClient client;                        // Objek client Ethernet
+unsigned long lastClientCheck = 0;            // Timer untuk mendeteksi timeout client
+const unsigned long clientTimeout = 1000;     // Timeout client (ms)
 
-// Deklarasi fungsi
+// ==== Deklarasi fungsi tambahan ====
 void handleRequest(EthernetClient &client, String request);
 void sendHTML(EthernetClient &client, String msg = "");
-void writeData(String id, String nama, String unit);
+void writeData(String id, String nama, String unit, String enable);
 void eraseAllData();
 void deleteRowById(String targetId);
 String urlDecode(String input);
+void ConvertByteToString(byte *ID);
+void readFile(fs::FS &fs, const char *path, String *Return, int arrayLength);
+void printFileRows(String *rows, int maxRows);
+String generateHTMLTable();
+String escapeHTML(String input);
+void toggleEnable(String targetId);
+bool checkCardAccess(String cardId);
 
-// ==========================================================================
-// Fungsi setup()
-// Inisialisasi SPI, Ethernet, dan SPIFFS
-// ==========================================================================
+// ==== Fungsi setup ====
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(115200);                       // Memulai komunikasi Serial
+  PN532Serial.begin(115200, SERIAL_8N1, 16, 17); // Inisialisasi UART2 untuk PN532
+  nfc.begin();                                // Mulai komunikasi PN532
 
-  // Inisialisasi SPI dengan pin yang ditentukan
+  // Konfigurasi GPIO 36 sebagai output
+  pinMode(OUTPUT_PIN, OUTPUT);
+  digitalWrite(OUTPUT_PIN, LOW); // Pastikan awal dalam keadaan LOW
+
+  // Cek versi firmware PN532
+  uint32_t versiondata = nfc.getFirmwareVersion();
+  if (!versiondata) {
+    Serial.println("❌ Tidak menemukan PN532");
+    while (1); // Stop program
+  }
+  Serial.print("✅ PN532 Ditemukan, Firmware versi: 0x");
+  Serial.println(versiondata, HEX);
+  nfc.SAMConfig();                            // Konfigurasi secure access mode
+  Serial.println("Scan kartu NFC...");
+
+  // Inisialisasi SPI untuk Ethernet W5500
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_CS);
-  Ethernet.init(PIN_CS); // Inisialisasi Ethernet dengan CS
+  Ethernet.init(PIN_CS);                     // Tentukan pin CS Ethernet
 
-  // Mount SPIFFS
+  // Mount SPIFFS filesystem
   if (!SPIFFS.begin(true)) {
     Serial.println("Gagal mount SPIFFS");
     return;
   }
 
-  // Mulai koneksi Ethernet
+  // Inisialisasi koneksi Ethernet dengan IP statis
   Ethernet.begin(mac, ip);
   delay(1000);
-  server.begin();
-
+  server.begin();                             // Mulai server
   Serial.print("Server aktif di: ");
   Serial.println(Ethernet.localIP());
 
-  // Cek dan buat file jika belum ada
+  // Jika file belum ada, buat file kosong
   if (!SPIFFS.exists(dataPath)) {
     File f = SPIFFS.open(dataPath, FILE_WRITE);
     f.close();
   }
+
+  // Baca isi file ke array dan tampilkan ke Serial
+  readFile(SPIFFS, dataPath, fileRows, MAX_ROWS);
+  printFileRows(fileRows, MAX_ROWS);
 }
 
-// ==========================================================================
-// Fungsi loop()
-// Menangani koneksi client dan permintaan HTTP
-// ==========================================================================
+// ==== Fungsi utama loop ====
 void loop() {
+  // Cek apakah client terhubung
   if (!client || !client.connected()) {
-    client = server.available();
+    client = server.available();         // Cek koneksi baru
     currentRequest = "";
-    lastClientCheck = millis();
+    lastClientCheck = millis();          // Simpan waktu koneksi
     return;
   }
 
-  // Baca permintaan client
+  // Menerima data dari client
   while (client.available()) {
     char c = client.read();
     currentRequest += c;
 
-    // Jika akhir request tercapai, proses permintaan
+    // Cek apakah request HTTP selesai (diakhiri \r\n\r\n)
     if (currentRequest.endsWith("\r\n\r\n")) {
-      handleRequest(client, currentRequest);
-      client.stop();
+      handleRequest(client, currentRequest); // Proses permintaan HTTP
+      client.stop();                         // Tutup koneksi
       return;
     }
   }
 
-  // Jika timeout, putuskan koneksi
+  // Jika tidak ada data dari client selama batas waktu, putuskan koneksi
   if (millis() - lastClientCheck > clientTimeout) {
     client.stop();
     Serial.println("Client timeout");
   }
-}
 
-// ==========================================================================
-// Fungsi handleRequest()
-// Memproses permintaan dari client berdasarkan URL
-// ==========================================================================
-void handleRequest(EthernetClient &client, String request) {
-  Serial.println("Memproses request:");
-  Serial.println(request);
-
-  if (request.indexOf("GET /erase") >= 0) {
-    eraseAllData();
-    sendHTML(client, "Semua data berhasil dihapus.");
-  } 
-  else if (request.indexOf("GET /delete?id=") >= 0) {
-    int idIndex = request.indexOf("id=") + 3;
-    String id = request.substring(idIndex, request.indexOf(" ", idIndex));
-    id = urlDecode(id);
-    deleteRowById(id);
-    sendHTML(client, "Data berhasil dihapus.");
-  } 
-  else if (request.indexOf("GET /add?") >= 0) {
-    int i1 = request.indexOf("id=") + 3;
-    int i2 = request.indexOf("&nama=");
-    int i3 = request.indexOf("&unit=");
-    String id = urlDecode(request.substring(i1, i2));
-    String nama = urlDecode(request.substring(i2 + 6, i3));
-    String unit = urlDecode(request.substring(i3 + 6, request.indexOf(" ", i3)));
-    writeData(id, nama, unit);
-    sendHTML(client, "Data berhasil ditambahkan.");
-  } 
-  else {
-    sendHTML(client); // Tampilkan halaman default
-  }
-}
-
-// ==========================================================================
-// Fungsi sendHTML()
-// Mengirim halaman HTML ke browser client
-// ==========================================================================
-void sendHTML(EthernetClient &client, String msg) {
-  // Header HTTP
-  client.println("HTTP/1.1 200 OK");
-  client.println("Content-Type: text/html");
-  client.println("Connection: close");
-  client.println();
-
-  // HTML dan CSS halaman
-  client.println("<!DOCTYPE html><html><head><title>Elban Rendani</title>");
-  client.println("<style>");
-  client.println("body { background-color: #121212; color: #f5f5f5; font-family: sans-serif; padding: 20px; text-align: center; }");
-  client.println("table { width: 100%; border-collapse: collapse; margin-top: 20px; }");
-  client.println("th, td { padding: 12px; border: 1px solid #333; text-align: center; }");
-  client.println("th { background-color: #222; color: #fff; }");
-  client.println("tr:nth-child(even) { background-color: #1e1e1e; }");
-  client.println("tr:hover { background-color: #2c2c2c; }");
-  client.println("input, button { padding: 8px; background-color: #333; color: white; border: none; margin-top: 5px; }");
-  client.println("a { color: #4FC3F7; text-decoration: none; }");
-  client.println("a:hover { text-decoration: underline; }");
-  client.println("</style></head><body>");
-
-  client.println("<h2>Elban Rendani</h2>");
-  client.println("<p><i>Register RFID 1</i></p>");
-
-  if (msg != "") client.println("<p><b>" + msg + "</b></p>");
-
-  // Tabel data dari file
-  client.println("<table><tr><th>ID</th><th>Nama</th><th>Enable</th><th>Aksi</th></tr>");
-  File file = SPIFFS.open(dataPath);
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    if (line.length() > 0) {
-      int p1 = line.indexOf(',');
-      int p2 = line.lastIndexOf(',');
-      String id = line.substring(0, p1);
-      String nama = line.substring(p1 + 1, p2);
-      String unit = line.substring(p2 + 1);
-      client.print("<tr><td>" + id + "</td><td>" + nama + "</td><td>" + unit + "</td>");
-      client.print("<td><a href='/delete?id=" + id + "'>Hapus</a></td></tr>");
+  // Cek apakah ada kartu RFID yang terbaca
+  uint8_t uid[7];
+  uint8_t uidLength;
+  if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength)) {
+    Serial.print("UID Tag: ");
+    for (uint8_t i = 0; i < uidLength; i++) {
+      Serial.print(uid[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
+    ConvertByteToString(uid); // Simpan hasil ke String_ID
+    
+    // Cek apakah kartu terdaftar dan aktif
+    if (checkCardAccess(String_ID)) {
+      digitalWrite(OUTPUT_PIN, HIGH); // Aktifkan GPIO 36
+      Serial.println("Kartu terdaftar dan aktif - GPIO 36 HIGH");
+      delay(1000); // Tahan HIGH selama 1 detik
+      digitalWrite(OUTPUT_PIN, LOW); // Matikan GPIO 36
+      Serial.println("GPIO 36 LOW");
+    } else {
+      Serial.println("Kartu tidak terdaftar atau tidak aktif");
     }
   }
-  file.close();
-  client.println("</table>");
-
-  // Form tambah data
-  client.println("<h3>Tambah Data</h3>");
-  client.println("<form action='/add' method='GET'>");
-  client.println("ID: <input type='text' name='id'><br>");
-  client.println("Nama: <input type='text' name='nama'><br>");
-  client.println("Enable: <input type='text' name='unit'><br>");
-  client.println("<input type='submit' value='Tambah'>");
-  client.println("</form>");
-  client.println("<br><a href='/erase'><button>Hapus Semua Data</button></a>");
-  client.println("</body></html>");
 }
 
-// ==========================================================================
-// Fungsi writeData()
-// Menambahkan data baru ke file SPIFFS
-// ==========================================================================
-void writeData(String id, String nama, String unit) {
-  File file = SPIFFS.open(dataPath, FILE_APPEND);
-  if (!file) {
-    Serial.println("Gagal menulis ke file");
-    return;
-  }
-  file.println(id + "," + nama + "," + unit);
-  file.close();
-}
-
-// ==========================================================================
-// Fungsi eraseAllData()
-// Menghapus semua data dalam file
-// ==========================================================================
-void eraseAllData() {
-  SPIFFS.remove(dataPath);                // Hapus file
-  File f = SPIFFS.open(dataPath, FILE_WRITE); // Buat ulang file kosong
-  f.close();
-}
-
-// ==========================================================================
-// Fungsi deleteRowById()
-// Menghapus 1 baris data berdasarkan ID
-// ==========================================================================
-void deleteRowById(String targetId) {
-  File file = SPIFFS.open(dataPath, FILE_READ);
-  String newData = "";
-
-  // Salin semua data kecuali yang ID-nya cocok
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    if (line.length() > 0) {
-      String idStr = line.substring(0, line.indexOf(','));
-      if (idStr != targetId) {
-        newData += line + "\n";
+// ==== Fungsi: Cek apakah kartu terdaftar dan aktif ====
+bool checkCardAccess(String cardId) {
+  for (int i = 0; i < MAX_ROWS; i++) {
+    if (fileRows[i].length() > 0) {
+      // Format data: ID|Nama|Unit|Enable
+      int firstPipe = fileRows[i].indexOf('|');
+      if (firstPipe != -1) {
+        String id = fileRows[i].substring(0, firstPipe);
+        if (id == cardId) {
+          // Cek status enable
+          int thirdPipe = fileRows[i].lastIndexOf('|');
+          if (thirdPipe != -1) {
+            String enable = fileRows[i].substring(thirdPipe + 1);
+            return (enable == "1");
+          }
+        }
       }
     }
   }
-  file.close();
-
-  // Tulis ulang file tanpa data yang dihapus
-  File writeFile = SPIFFS.open(dataPath, FILE_WRITE);
-  writeFile.print(newData);
-  writeFile.close();
+  return false;
 }
 
-// ==========================================================================
-// Fungsi urlDecode()
-// Mengubah karakter URL (%20 → spasi, dll) ke bentuk asli
-// ==========================================================================
-String urlDecode(String input) {
-  String decoded = "";
-  char c;
-  for (int i = 0; i < input.length(); i++) {
-    c = input[i];
-    if (c == '+') {
-      decoded += ' ';
-    } else if (c == '%') {
-      String hex = input.substring(i + 1, i + 3);
-      decoded += (char) strtol(hex.c_str(), NULL, 16);
-      i += 2;
-    } else {
-      decoded += c;
-    }
-  }
-  return decoded;
-}
