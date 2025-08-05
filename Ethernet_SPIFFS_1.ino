@@ -252,13 +252,10 @@ void sendRedirect(EthernetClient &client, String location) {
 }
 
 void handleRFID() {
-  // Non-blocking RFID check
-  if (millis() - lastRfidCheck > RFID_CHECK_INTERVAL) {
-    lastRfidCheck = millis();
-    
+
     uint8_t uid[7];
     uint8_t uidLength;
-    if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 0)) {
+    if (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLength, 25)) {
       Serial.print("📇 Card detected: ");
       ConvertByteToString(uid, uidLength);
       Serial.println(String_ID);
@@ -271,7 +268,7 @@ void handleRFID() {
         accessDenied();
       }
     }
-  }
+  
 }
 
 void grantAccess(String cardId) {
