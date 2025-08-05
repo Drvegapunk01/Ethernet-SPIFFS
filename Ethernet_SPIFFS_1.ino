@@ -113,11 +113,11 @@ void setup() {
   SPI.begin(18, 19, 23, 5);
   Ethernet.init(5);
   
-  if (Ethernet.begin(mac) == 0) {
-    Serial.println("⚠️ Failed to configure Ethernet using DHCP");
+  // if (Ethernet.begin(mac) == 0) {
+  //   Serial.println("⚠️ Failed to configure Ethernet using DHCP");
     // Fall back to static IP
     Ethernet.begin(mac, ip);
-  }
+  // }
   
   server.begin();
   Serial.print("💻 Server started at ");
